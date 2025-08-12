@@ -110,20 +110,36 @@ def get_video_info():
             audio_formats = []
             combined_formats = []  # Formats with both video and audio
             
+            duration_seconds = info.get('duration') or 0
+
+            def approx_size_bytes_from_tbr(tbr_kbps, duration_s):
+                if not tbr_kbps or not duration_s:
+                    return None
+                try:
+                    return int(duration_s * tbr_kbps * 125)  # 1000/8 = 125 bytes per kbps per second
+                except Exception:
+                    return None
+
             for f in info['formats']:
                 print(f"Processing format: {f.get('format_id')} - vcodec: {f.get('vcodec')} - acodec: {f.get('acodec')}")
                 
+                raw_filesize = f.get('filesize') or f.get('filesize_approx')
+                if not raw_filesize:
+                    raw_filesize = approx_size_bytes_from_tbr(f.get('tbr'), duration_seconds)
+
                 format_info = {
                     'format_id': f['format_id'],
                     'ext': f['ext'],
                     'resolution': f.get('resolution', 'N/A'),
-                    'filesize': f.get('filesize', 'N/A'),
+                    'filesize': raw_filesize,
+                    'filesize_bytes': raw_filesize,
                     'vcodec': f.get('vcodec', 'N/A'),
                     'acodec': f.get('acodec', 'N/A'),
                     'format_note': f.get('format_note', ''),
                     'height': f.get('height', 0),
                     'fps': f.get('fps', 0),
                     'tbr': f.get('tbr', 0),
+                    'abr': f.get('abr', 0),
                 }
                 
                 # Combined formats (has both video and audio) - these are most compatible
@@ -140,84 +156,105 @@ def get_video_info():
                     audio_formats.append(format_info)
                     print(f"Added to audio formats: {f['format_id']}")
             
-            # Create a curated list of download options
+            # Create a curated list of download options according to requirements:
+            # - 1 best available video option
+            # - up to 2 lower resolution video options
+            # - 1 audio-only option
             final_video_formats = []
-            
-            # First, add the best combined formats (video+audio in one file)
-            if combined_formats:
-                # Sort by quality and prefer MP4
-                combined_formats.sort(key=lambda x: (
-                    x['ext'] == 'mp4',
-                    x['height'],
-                    x['tbr'] or 0
-                ), reverse=True)
-                
-                # Add top 3 combined formats
-                for fmt in combined_formats[:3]:
-                    fmt['format_note'] = f"{fmt['format_note']} (Video+Audio)".strip()
-                    final_video_formats.append(fmt)
-            
-            # Add a "Best Quality MP4" option
-            final_video_formats.insert(0, {
-                'format_id': 'best_mp4',
-                'ext': 'mp4',
-                'resolution': 'Best Available',
-                'filesize': 'N/A',
-                'format_note': 'Best Quality MP4 (Recommended)',
-                'height': 9999,  # For sorting
-                'tbr': 9999
-            })
-            
-            # Add some merged format options for better quality
-            popular_heights = [720, 1080, 480, 360]
-            for height in popular_heights:
-                height_formats = [f for f in video_formats if f['height'] == height and f['ext'] == 'mp4']
-                if height_formats:
-                    best_format = max(height_formats, key=lambda x: x['tbr'] or 0)
-                    merged_format = best_format.copy()
-                    merged_format['format_id'] = f"merged_{best_format['format_id']}"
-                    merged_format['format_note'] = f"{height}p MP4 (Auto-merged with audio)"
-                    final_video_formats.append(merged_format)
-                    break  # Only add one merged option
-            
-            # Filter audio formats - keep only the best quality ones
-            filtered_audio_formats = []
-            
-            # Add a simple "Audio Only" option
-            if audio_formats:
-                filtered_audio_formats.append({
-                    'format_id': 'audio_only',
-                    'ext': 'mp3',
-                    'resolution': 'Audio Only',
-                    'filesize': 'N/A',
-                    'format_note': 'Best Quality Audio (MP3)',
-                    'acodec': 'mp3',
-                    'tbr': 9999
-                })
-            
-            # Sort by bitrate descending and add top 2 original audio formats
-            audio_formats.sort(key=lambda x: x['tbr'] or 0, reverse=True)
-            for f in audio_formats[:2]:
-                if f not in filtered_audio_formats:
-                    filtered_audio_formats.append(f)
-            
-            # Limit final results
-            final_video_formats = final_video_formats[:6]
-            filtered_audio_formats = filtered_audio_formats[:3]
-            
-            # If no formats found, add fallback options
-            if not final_video_formats and not filtered_audio_formats:
-                print("No formats found with primary filtering, adding fallback options")
-                # Add a basic best format option
+
+            def sort_key_with_preferences(fmt):
+                return (
+                    fmt.get('ext') == 'mp4',
+                    fmt.get('height') or 0,
+                    fmt.get('tbr') or 0
+                )
+
+            combined_sorted = sorted(combined_formats, key=sort_key_with_preferences, reverse=True)
+            video_sorted = sorted(video_formats, key=sort_key_with_preferences, reverse=True)
+
+            picked_heights = []  # Track unique heights picked, highest first
+
+            def add_combined(fmt):
+                item = fmt.copy()
+                note = (item.get('format_note') or '').strip()
+                item['format_note'] = f"{note + ' ' if note else ''}(Video+Audio)"
+                final_video_formats.append(item)
+
+            def add_merged(fmt):
+                fmt_height = fmt.get('height') or 0
+                item = fmt.copy()
+                item['format_id'] = f"merged_{fmt['format_id']}"
+                item['format_note'] = f"{fmt_height}p MP4 (Auto-merged with audio)" if fmt_height else "Auto-merged with audio"
+                # Estimate merged filesize: video + best audio
+                best_audio = None
+                if audio_formats:
+                    best_audio = max(audio_formats, key=lambda x: x.get('tbr') or 0)
+                video_size = item.get('filesize_bytes') or approx_size_bytes_from_tbr(item.get('tbr'), duration_seconds)
+                audio_size = None
+                if best_audio:
+                    audio_size = best_audio.get('filesize_bytes') or approx_size_bytes_from_tbr(best_audio.get('tbr') or best_audio.get('abr'), duration_seconds)
+                if video_size and audio_size:
+                    item['filesize_bytes'] = video_size + audio_size
+                    item['filesize'] = item['filesize_bytes']
+                final_video_formats.append(item)
+
+            # Step 1: pick the best (highest) combined if available, else best video-only (merged)
+            if combined_sorted:
+                add_combined(combined_sorted[0])
+                picked_heights.append(combined_sorted[0].get('height') or 0)
+            elif video_sorted:
+                add_merged(video_sorted[0])
+                picked_heights.append(video_sorted[0].get('height') or 0)
+
+            # Step 2: fill up to two lower resolution unique heights, preferring combined
+            def fill_lower_res(candidates, adder):
+                for fmt in candidates:
+                    if len(final_video_formats) >= 3:
+                        break
+                    height_value = fmt.get('height') or 0
+                    if not picked_heights:
+                        continue
+                    best_height = picked_heights[0]
+                    if height_value < best_height and height_value not in picked_heights:
+                        adder(fmt)
+                        picked_heights.append(height_value)
+
+            fill_lower_res(combined_sorted[1:], add_combined)
+            if len(final_video_formats) < 3:
+                fill_lower_res(video_sorted, add_merged)
+
+            # If nothing could be selected, provide a single generic best option as a last resort
+            if not final_video_formats:
                 final_video_formats = [{
                     'format_id': 'best_mp4',
                     'ext': 'mp4',
                     'resolution': 'Best Available',
                     'filesize': 'N/A',
-                    'format_note': 'Best Quality (Fallback)',
-                    'height': 999,
-                    'tbr': 999
+                    'format_note': 'Best Quality (Auto)',
+                    'height': 0,
+                    'tbr': 0
                 }]
+
+            # Build audio-only list: provide a single best quality audio option (mp3 extraction)
+            filtered_audio_formats = []
+            if audio_formats or combined_formats:
+                # Choose best audio candidate to estimate size
+                best_audio_src = None
+                if audio_formats:
+                    best_audio_src = max(audio_formats, key=lambda x: x.get('tbr') or 0)
+                est_size = None
+                if best_audio_src:
+                    est_size = best_audio_src.get('filesize_bytes') or approx_size_bytes_from_tbr(best_audio_src.get('tbr') or best_audio_src.get('abr'), duration_seconds)
+                filtered_audio_formats.append({
+                    'format_id': 'audio_only',
+                    'ext': 'mp3',
+                    'resolution': 'Audio Only',
+                    'filesize': est_size,
+                    'filesize_bytes': est_size,
+                    'format_note': 'Best Quality Audio (MP3)',
+                    'acodec': 'mp3',
+                    'tbr': best_audio_src.get('tbr') if best_audio_src else 0
+                })
             
             print(f"Final counts - Video formats: {len(final_video_formats)}, Audio formats: {len(filtered_audio_formats)}")
             
